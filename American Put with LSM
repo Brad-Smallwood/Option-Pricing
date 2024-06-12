@@ -1,0 +1,189 @@
+# Pricing an American Put
+# Recreating the first example from the Longstaff & Schwartz paper.
+
+# Packages
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
+
+# Dataset from Longstaff & Schwartz.
+df_Stock_Paths = pd.DataFrame({
+    'Path': [1, 2, 3, 4, 5, 6, 7, 8],
+    '0': [1, 1, 1, 1, 1, 1, 1, 1],
+    '1': [1.09, 1.16, 1.22, 0.93, 1.11, 0.76, 0.92, 0.88],
+    '2': [1.08, 1.26, 1.07, 0.97, 1.56, 0.77, 0.84, 1.22],
+    '3': [1.34, 1.54, 1.03, 0.92, 1.52, 0.90, 1.01, 1.34]
+})
+
+# Convert to long format.
+df_Stock_Paths_Long = pd.melt(df_Stock_Paths, id_vars=['Path'], value_vars=['0', '1', '2', '3'], var_name='Time', value_name='Price')
+
+# Make sure columns are numeric.
+df_Stock_Paths_Long['Path'] = pd.to_numeric(df_Stock_Paths_Long['Path'])
+df_Stock_Paths_Long['Time'] = pd.to_numeric(df_Stock_Paths_Long['Time'])
+df_Stock_Paths_Long['Price'] = pd.to_numeric(df_Stock_Paths_Long['Price'])
+
+# Sort the dataframe.
+df_Stock_Paths_Long = df_Stock_Paths_Long.sort_values(by=['Path', 'Time'])
+
+def get_exercise_value(x: float, K: float):
+    """ 
+    Args:
+        x: Price, float.
+        K: Strike price.  Float.
+    Returns:
+        Exercise value of the option. 
+    """
+    return np.maximum(K-x, 0)
+
+def find_First_Execution(row):
+    """ Replace all subsequent 1's in an array with 0's following the first occurance of a 1.
+    Args:
+        row: Row of 1's, and 0's. Array.
+    Returns:
+        row: Row with subsequent 1's replaced with 0's.  Array.
+    """
+    encountered_one = False
+    for i in range(len(row)):
+        if encountered_one:
+            row.iloc[i] = 0
+        elif row.iloc[i] == 1:
+            encountered_one = True
+    return row
+
+def calculate_PV(cashflows, discount_rate):
+    """ 
+  Continous discount cashflows.
+    Args:
+        cashflows: Cashflows.  Array.
+        discount_rate: Risk free rate to use for discounting.  Float.
+    Returns:
+        pv: Present value of the provided cashflows. Float.
+    """
+    time_periods = np.arange(1, len(cashflows)+1, 1)
+    discount_factor = np.exp(-discount_rate*time_periods)
+    pv = sum(cashflows*discount_factor)
+    return pv
+
+def value_American_Put_Option_LS(df: pd.DataFrame, K: float, r: float, verbose: bool):
+    """ 
+    Args:
+        X: Simulated stock prices. Pandas dataframe.
+        K: Strike price.  Float.
+        r: Risk-Free Rate. Float.
+        verbose: Print final dataframe.  Boolean.
+    Returns:
+        Value of the option.
+    """
+
+    # Set the dataframe index as the path ID. If first column isn't named path then raise error for user to format the provided dataframe correctly.
+    if df.columns[0] != 'Path':
+        raise ValueError('Provided dataframe is not formatted correctly.  Data should be in wide format with first column being the path ID and named "Path".')
+    else:
+        df = df.set_index('Path')
+
+    # Determine the number of iteration to go through.  Usually just the time to maturity.
+    iter_max = len(df.columns)
+
+    # Initialize new dataframe for stopping rules. Used outside of the loop at the end to determine optimal cashflows.
+    df_SR = df
+    column_names = df.columns
+    df_SR = df_SR.drop(column_names, inplace=False, axis=1)
+
+    # Loop through each time step from time of option expiry to t=1
+    for t in range(iter_max-1, 0, -1):
+
+        # Check if this is the maturity time period or not.  If it is then decision is determined same as a european option.
+        if t == (iter_max-1):
+
+            # Calculate cashflows and determine if the option should be executed.
+            cash_flows_at_expiry = get_exercise_value(df.iloc[:, t], K)
+            df_cash_flows_at_expiry = pd.DataFrame(np.where(cash_flows_at_expiry != 0, 1, 0))
+
+            # Make sure the index matches df_SR
+            df_cash_flows_at_expiry.set_index(df_SR.index, inplace=True)
+
+            # Rename column
+            new_column_name = f"{'Decision'}_{t}"
+            df_cash_flows_at_expiry.columns = [new_column_name]
+
+            # Left join to df_SR
+            df_SR = df_SR.merge(df_cash_flows_at_expiry, left_index=True, right_index=True, how='left')
+
+        else: # If not the last period, then calcualte continuation values and compare to value of executing during this period.
+            # Get cashflows for the current time period.
+            cash_flows = get_exercise_value(df, K)
+
+            # Get variables for the regression.
+            df_Reg = pd.DataFrame(df.iloc[:, t])
+            df_Reg['X_Squared'] = df.iloc[:, t]**2
+            df_Reg.columns = ['X', 'X_Squared']
+            df_Reg = df_Reg[df_Reg['X'] <= K]
+            
+            # Filter for only cashflows greater than 0 and discount cashflows back one period.
+            Y = pd.DataFrame(cash_flows*np.exp(-r*1)).filter(items=df_Reg.index, axis=0).iloc[:, t+1]
+
+            # Perform regression
+            model = LinearRegression().fit(df_Reg, Y)
+
+            # Get Continuation value, the value of not executing the option at t.
+            df_Continuation_Value = pd.DataFrame(model.predict(df_Reg))
+            df_Continuation_Value.set_index(df_Reg.index, inplace=True)
+
+            # Get exercise value
+            df_Exercise_Value = pd.DataFrame(get_exercise_value(df.iloc[:, t].filter(items=df_Reg.index, axis=0), K))
+
+            # Combine dataframes.
+            df_Opt_Early_Exercise = df_Exercise_Value.merge(df_Continuation_Value, left_index=True, right_index=True, how='left')
+            df_Opt_Early_Exercise.columns = ['Exercise Value', 'Continuation Value']
+
+            # Execute if exercise value is greater than continuation value.  0 otherwise.
+            df_Opt_Early_Exercise['Decision'] = np.where(df_Opt_Early_Exercise['Exercise Value'] > df_Opt_Early_Exercise['Continuation Value'], 1, 0)
+
+            # Rename the decision column to denote the time period t.
+            new_column_name = f"{'Decision'}_{t}"
+            df_Opt_Early_Exercise.rename(columns={'Decision': new_column_name}, inplace=True)
+            
+            # Drop value columns, no longer needed.
+            df_Opt_Early_Exercise.drop(['Exercise Value', 'Continuation Value'], inplace=True, axis=1)
+
+            # Join to df_SR
+            df_SR = df_SR.merge(df_Opt_Early_Exercise, left_index=True, right_index=True, how='left')
+            
+        # End of loop
+
+    # Replace NaN with 0, no cashflow.
+    df_SR.fillna(0, inplace=True)
+
+    # Fix column order. Order by time.
+    reversed_columns = df_SR.columns[::-1]
+    df_SR = df_SR[reversed_columns]
+
+    # Determine earliest exectution date for each path.
+    df_SR = df_SR.apply(find_First_Execution, axis=1)
+
+    # Get exercise value at each time point.
+    df_Exer_Value = get_exercise_value(df.iloc[:, 1:], K)
+
+    # Change the 1's to the value from executing the option.
+    df_Results = pd.DataFrame(np.where(df_SR == 1, df_Exer_Value, 0))
+
+    # Clean df_Results and discount the cashflows to present.
+    df_Results.columns = np.arange(1, len(df_Results.columns)+1, 1)
+    df_Results.index = df_Results.index + 1
+    df_Results['0'] = df_Results.apply(lambda row: calculate_PV(row, r), axis=1)
+    df_Results.insert(0, '0', df_Results.pop('0')) # Move Path_ID to the beginning of the dataframe.
+
+    # Print results.
+    if(verbose == True):
+        print(df_Results)
+
+    # Calculate value of the option.  Average over all paths.
+    option_value = np.mean(df_Results['0'])
+
+    # Return option value.
+    return option_value
+
+# Calculate value of American put.
+value_American_Put_Option_LS(df = df_Stock_Paths, K = 1.10, r = 0.06)
