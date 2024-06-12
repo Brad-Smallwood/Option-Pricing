@@ -1,5 +1,6 @@
 # Pricing an American Put
 # Recreating the first example from the Longstaff & Schwartz paper.
+# https://people.math.ethz.ch/~hjfurrer/teaching/LongstaffSchwartzAmericanOptionsLeastSquareMonteCarlo.pdf
 
 # Packages
 import numpy as np
